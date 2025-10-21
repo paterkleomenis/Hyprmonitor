@@ -3,7 +3,10 @@ name: Rust (Linux build)
 on:
   push:
     tags:
-      - "v*" # Only run when you push a version tag like v1.0.0
+      - "v*" # Run only when pushing a version tag like v1.0.0
+
+permissions:
+  contents: write # ✅ Required to create releases
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,7 +21,7 @@ jobs:
       - name: Build release for Linux
         run: cargo build --release --target x86_64-unknown-linux-gnu
 
-      - name: Create release
+      - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: target/x86_64-unknown-linux-gnu/release/hypr-tui
