@@ -2,9 +2,8 @@ name: Rust (Linux build)
 
 on:
   push:
-    branches: ["main"]
-  pull_request:
-    branches: ["main"]
+    tags:
+      - "v*" # Only run when you push a version tag like v1.0.0
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,11 +18,9 @@ jobs:
       - name: Build release for Linux
         run: cargo build --release --target x86_64-unknown-linux-gnu
 
-      - name: Run tests
-        run: cargo test --release --verbose --target x86_64-unknown-linux-gnu
-
-      - name: Upload Linux executable
-        uses: actions/upload-artifact@v4
+      - name: Create release
+        uses: softprops/action-gh-release@v2
         with:
-          name: hypr-tui-linux
-          path: target/x86_64-unknown-linux-gnu/release/hypr-tui
+          files: target/x86_64-unknown-linux-gnu/release/hypr-tui
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
