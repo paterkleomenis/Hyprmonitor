@@ -14,9 +14,16 @@ use std::{
 // --- Constants ---
 const SCALE_STEP: i32 = 25;
 const MIN_SCALE: i32 = 50;
-const OPTION_COUNT: usize = 5;
+const OPTION_COUNT: usize = 10;
+
+// Indices reordered for better UX
 const APPLY_OPTION_IDX: usize = 3;
-const DISABLE_OPTION_IDX: usize = 4;
+const SET_MAIN_IDX: usize = 4;
+const EXTEND_LEFT_IDX: usize = 5;
+const EXTEND_RIGHT_IDX: usize = 6;
+const MIRROR_IDX: usize = 7;
+const BLACK_SCREEN_IDX: usize = 8;
+const DISABLE_OPTION_IDX: usize = 9;
 
 // --- Data Structures ---
 #[derive(Deserialize, Debug, Clone)]
@@ -36,6 +43,7 @@ struct MonitorConfig {
     scale: i32,
     resolution_index: usize,
     refresh_rate_index: usize,
+    dpms_on: bool,
 }
 
 impl MonitorConfig {
@@ -133,6 +141,7 @@ impl App {
                 scale,
                 resolution_index: res_idx,
                 refresh_rate_index: refresh_idx,
+                dpms_on: true,
             },
         )))
     }
@@ -153,7 +162,6 @@ impl App {
             }
         }
 
-        // Sort descending and deduplicate
         for rates in modes.values_mut() {
             rates.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
             rates.dedup_by(|a, b| (*a - *b).abs() < 0.01);
@@ -268,7 +276,6 @@ impl App {
         config.resolution = resolutions[config.resolution_index].clone();
         config.refresh_rate_index = 0;
 
-        // Update refresh rate to first available for new resolution
         if let Some(rates) = self.monitors[mon_idx].modes.get(&config.resolution) {
             config.refresh_rate = rates.first().copied().unwrap_or(60.0);
         }
@@ -310,6 +317,107 @@ impl App {
             .unwrap_or(false)
     }
 
+    fn get_other_monitor_info(&self, current_idx: usize) -> Option<(usize, String)> {
+        self.monitors
+            .iter()
+            .enumerate()
+            .find(|(i, m)| *i != current_idx && m.active)
+            .map(|(i, m)| (i, m.name.clone()))
+    }
+
+    fn set_as_main(&self) {
+        let Some(idx) = self.monitor_list_state.selected() else {
+            return;
+        };
+        let monitor = &self.monitors[idx];
+        let config = &self.configs[idx];
+
+        let command = format!(
+            "hyprctl keyword monitor \"{},preferred,{}@{:.2},auto,{:.2}\"",
+            monitor.name,
+            config.resolution,
+            config.refresh_rate,
+            config.scale_as_float()
+        );
+        self.execute_hyprctl(&command);
+    }
+
+    fn extend_relative(&self, direction: &str) {
+        let Some(idx) = self.monitor_list_state.selected() else {
+            return;
+        };
+
+        if let Some((_, other_monitor_name)) = self.get_other_monitor_info(idx) {
+            let monitor = &self.monitors[idx];
+            let config = &self.configs[idx];
+
+            let command = format!(
+                "hyprctl keyword monitor \"{},{}@{:.2},auto,{:.2},{}of,{}\"",
+                monitor.name,
+                config.resolution,
+                config.refresh_rate,
+                config.scale_as_float(),
+                direction,
+                other_monitor_name
+            );
+            self.execute_hyprctl(&command);
+        }
+    }
+
+    fn mirror_monitor(&mut self) {
+        let Some(idx) = self.monitor_list_state.selected() else {
+            return;
+        };
+
+        if let Some((other_idx, other_monitor_name)) = self.get_other_monitor_info(idx) {
+            let source_scale;
+            let source_resolution;
+            let source_refresh_rate;
+            let source_scale_float;
+
+            {
+                let source_config = &self.configs[idx];
+                source_scale = source_config.scale;
+                source_resolution = source_config.resolution.clone();
+                source_refresh_rate = source_config.refresh_rate;
+                source_scale_float = source_config.scale_as_float();
+            }
+
+            let source_monitor_name = &self.monitors[idx].name;
+
+            self.configs[other_idx].scale = source_scale;
+
+            let command = format!(
+                "hyprctl keyword monitor \"{},{}@{:.2},auto,{:.2},mirror,{}\"",
+                source_monitor_name,
+                source_resolution,
+                source_refresh_rate,
+                source_scale_float,
+                other_monitor_name
+            );
+            self.execute_hyprctl(&command);
+        }
+    }
+
+    fn toggle_dpms(&mut self) {
+        let Some(idx) = self.monitor_list_state.selected() else {
+            return;
+        };
+
+        let is_on = self.configs[idx].dpms_on;
+        let monitor_name = &self.monitors[idx].name;
+
+        let command = if is_on {
+            format!("hyprctl dispatch dpms off {}", monitor_name)
+        } else {
+            format!("hyprctl dispatch dpms on {}", monitor_name)
+        };
+
+        if self.execute_hyprctl(&command) {
+            self.configs[idx].dpms_on = !is_on;
+        }
+    }
+
     fn apply_changes(&self) {
         let Some(idx) = self.monitor_list_state.selected() else {
             return;
@@ -319,10 +427,10 @@ impl App {
         let config = &self.configs[idx];
 
         let command = format!(
-            "hyprctl --batch \"keyword monitor {},reset;keyword monitor {},{},auto,{:.2}\"",
-            monitor.name,
+            "hyprctl keyword monitor \"{},{}@{:.2},auto,{:.2}\"",
             monitor.name,
             config.resolution,
+            config.refresh_rate,
             config.scale_as_float()
         );
 
@@ -371,6 +479,11 @@ impl App {
             KeyCode::Enter if self.focused_pane == FocusedPane::Options => {
                 match self.option_list_state.selected() {
                     Some(APPLY_OPTION_IDX) => self.apply_changes(),
+                    Some(SET_MAIN_IDX) => self.set_as_main(),
+                    Some(EXTEND_LEFT_IDX) => self.extend_relative("left"),
+                    Some(EXTEND_RIGHT_IDX) => self.extend_relative("right"),
+                    Some(MIRROR_IDX) => self.mirror_monitor(),
+                    Some(BLACK_SCREEN_IDX) => self.toggle_dpms(),
                     Some(DISABLE_OPTION_IDX) => self.disable_monitor(),
                     _ => {}
                 }
@@ -425,20 +538,26 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> io::Re
     Ok(())
 }
 
+// --- UI Rendering Functions ---
+
 fn ui(f: &mut Frame, app: &App) {
-    let [content_area, instructions_area] = Layout::default()
+    let main_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(3)])
-        .areas(f.size());
+        .constraints([Constraint::Min(0), Constraint::Max(3)])
+        .split(f.size());
 
-    let [monitors_area, options_area] = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .areas(content_area);
+    if let [content_area, instructions_area] = main_chunks[..] {
+        let content_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(content_area);
 
-    render_monitors_pane(f, app, monitors_area);
-    render_options_pane(f, app, options_area);
-    render_instructions(f, instructions_area);
+        if let [monitors_area, options_area] = content_chunks[..] {
+            render_monitors_pane(f, app, monitors_area);
+            render_options_pane(f, app, options_area);
+            render_instructions(f, instructions_area);
+        }
+    }
 }
 
 fn render_monitors_pane(f: &mut Frame, app: &App, area: Rect) {
@@ -475,12 +594,34 @@ fn render_options_pane(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let config = &app.configs[idx];
+    let dpms_status_text = if config.dpms_on { "On" } else { "Off" };
 
     let items = vec![
-        ListItem::new(format!("Resolution:   <{}>", config.resolution)),
-        ListItem::new(format!("Refresh Rate: <{:.1} Hz>", config.refresh_rate)),
-        ListItem::new(format!("Scale:        <{:.2}>", config.scale_as_float())),
-        ListItem::new(Line::from("-> Apply Changes <-").alignment(Alignment::Center)),
+        // Settings
+        ListItem::new(format!("{:<13} <{}>", "Resolution:", config.resolution)),
+        ListItem::new(format!(
+            "{:<13} <{:.1} Hz>",
+            "Refresh Rate:", config.refresh_rate
+        )),
+        ListItem::new(format!("{:<13} <{:.2}>", "Scale:", config.scale_as_float())),
+        // Apply button for the settings above
+        ListItem::new(
+            Line::from("-> Apply Changes <-")
+                .style(Style::default().fg(Color::Green))
+                .alignment(Alignment::Center),
+        ),
+        // Other immediate actions
+        ListItem::new(Line::from("Set as Main Screen").alignment(Alignment::Center)),
+        ListItem::new(Line::from("Extend Left").alignment(Alignment::Center)),
+        ListItem::new(Line::from("Extend Right").alignment(Alignment::Center)),
+        ListItem::new(Line::from("Mirror").alignment(Alignment::Center)),
+        ListItem::new(
+            Line::from(format!(
+                "Toggle Black Screen (Currently: {})",
+                dpms_status_text
+            ))
+            .alignment(Alignment::Center),
+        ),
         ListItem::new(
             Line::from("-> Disable Monitor <-")
                 .style(Style::default().fg(Color::Red))
@@ -499,10 +640,15 @@ fn render_options_pane(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_instructions(f: &mut Frame, area: Rect) {
     let text =
-        "Tab: Switch Panes | ↑/↓: Navigate | ←/→: Change Value | Enter: Apply/Disable | q: Quit";
+        "Tab: Switch Panes | ↑/↓: Navigate | ←/→: Change Value | Enter: Execute Action | q: Quit";
     let instructions = Paragraph::new(text)
         .style(Style::default().fg(Color::Yellow))
-        .alignment(Alignment::Center);
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(Color::Reset)),
+        );
 
     f.render_widget(instructions, area);
 }
