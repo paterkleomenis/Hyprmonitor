@@ -7,8 +7,20 @@ pub struct Monitor {
     pub name: String,
     #[serde(default)]
     pub active: bool,
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+    #[serde(default)]
+    pub width: i32,
+    #[serde(default = "default_scale")]
+    pub hypr_scale: f64,
     #[serde(skip)]
     pub modes: BTreeMap<String, Vec<f64>>,
+}
+
+fn default_scale() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone)]

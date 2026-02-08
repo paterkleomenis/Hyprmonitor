@@ -95,6 +95,10 @@ impl App {
             Monitor {
                 name,
                 active,
+                x: data["x"].as_i64().unwrap_or(0) as i32,
+                y: data["y"].as_i64().unwrap_or(0) as i32,
+                width: data["width"].as_i64().unwrap_or(0) as i32,
+                hypr_scale: data["scale"].as_f64().unwrap_or(1.0).max(0.1),
                 modes,
             },
             MonitorConfig {
@@ -177,6 +181,17 @@ impl App {
         } else {
             i64::MAX
         }
+    }
+
+    fn parse_resolution_dims(res: &str) -> Option<(i32, i32)> {
+        let mut parts = res.split('x');
+        let width = parts.next()?.parse::<i32>().ok()?;
+        let height = parts.next()?.parse::<i32>().ok()?;
+        Some((width, height))
+    }
+
+    fn scaled_dimension(size: i32, scale: f64) -> i32 {
+        ((size as f64) / scale.max(0.1)).round() as i32
     }
 
     fn cycle_selection(current: Option<usize>, max: usize, forward: bool) -> Option<usize> {
@@ -276,42 +291,105 @@ impl App {
             .map(|(i, m)| (i, m.name.clone()))
     }
 
-    fn set_as_main(&self) {
+    fn run_hyprctl_command(&mut self, args: &[&str], success_message: &str) -> bool {
+        if commands::execute_hyprctl_args(args) {
+            let _ = self.refresh_monitors();
+            self.info_message = Some(success_message.to_string());
+            true
+        } else {
+            self.info_message = Some("Failed to execute hyprctl command".to_string());
+            false
+        }
+    }
+
+    fn refresh_monitors(&mut self) -> io::Result<()> {
+        let previously_selected_name = self
+            .selected_monitor()
+            .and_then(|idx| self.monitors.get(idx))
+            .map(|monitor| monitor.name.clone());
+        let previous_index = self.monitor_list_state.selected().unwrap_or(0);
+        let previous_option = self.option_list_state.selected().unwrap_or(0);
+
+        let monitors_data = commands::fetch_monitors()?;
+        let (monitors, configs) = Self::parse_monitors(monitors_data)?;
+
+        self.monitors = monitors;
+        self.configs = configs;
+
+        if self.monitors.is_empty() {
+            self.monitor_list_state.select(None);
+        } else {
+            let selected_idx = previously_selected_name
+                .and_then(|name| self.monitors.iter().position(|m| m.name == name))
+                .unwrap_or(previous_index.min(self.monitors.len() - 1));
+            self.monitor_list_state.select(Some(selected_idx));
+        }
+
+        self.option_list_state
+            .select(Some(previous_option.min(OPTION_COUNT.saturating_sub(1))));
+
+        Ok(())
+    }
+
+    fn set_as_main(&mut self) {
         let Some(idx) = self.monitor_list_state.selected() else {
             return;
         };
         let monitor = &self.monitors[idx];
         let config = &self.configs[idx];
 
-        let command = format!(
-            "hyprctl keyword monitor \"{},preferred,{}@{:.2},auto,{:.2}\"",
+        // Place selected monitor at 0x0 to make it the primary reference display.
+        let monitor_value = format!(
+            "{},{}@{:.2},0x0,{:.2}",
             monitor.name,
             config.resolution,
             config.refresh_rate,
             config.scale_as_float()
         );
-        commands::execute_hyprctl(&command);
+        let _ = self.run_hyprctl_command(
+            &["keyword", "monitor", &monitor_value],
+            "Set monitor as main",
+        );
     }
 
-    fn extend_relative(&self, direction: &str) {
+    fn extend_relative(&mut self, direction: &str) {
         let Some(idx) = self.monitor_list_state.selected() else {
             return;
         };
 
-        if let Some((_, other_monitor_name)) = self.get_other_monitor_info(idx) {
+        if let Some((other_idx, _)) = self.get_other_monitor_info(idx) {
             let monitor = &self.monitors[idx];
             let config = &self.configs[idx];
+            let other_monitor = &self.monitors[other_idx];
 
-            let command = format!(
-                "hyprctl keyword monitor \"{},{}@{:.2},auto,{:.2},{}of,{}\"",
+            let Some((selected_width, _)) = Self::parse_resolution_dims(&config.resolution) else {
+                self.info_message = Some("Invalid selected monitor resolution".to_string());
+                return;
+            };
+
+            let selected_scaled_width =
+                Self::scaled_dimension(selected_width, config.scale_as_float());
+            let other_scaled_width = Self::scaled_dimension(other_monitor.width, other_monitor.hypr_scale);
+
+            let (x, y) = match direction {
+                "left" => (other_monitor.x - selected_scaled_width, other_monitor.y),
+                "right" => (other_monitor.x + other_scaled_width, other_monitor.y),
+                _ => (other_monitor.x, other_monitor.y),
+            };
+
+            let monitor_value = format!(
+                "{},{}@{:.2},{}x{},{:.2}",
                 monitor.name,
                 config.resolution,
                 config.refresh_rate,
-                config.scale_as_float(),
-                direction,
-                other_monitor_name
+                x,
+                y,
+                config.scale_as_float()
             );
-            commands::execute_hyprctl(&command);
+            let message = format!("Extended {} monitor", direction);
+            let _ = self.run_hyprctl_command(&["keyword", "monitor", &monitor_value], &message);
+        } else {
+            self.info_message = Some("No other active monitor to extend against".to_string());
         }
     }
 
@@ -338,15 +416,20 @@ impl App {
 
             self.configs[other_idx].scale = source_scale;
 
-            let command = format!(
-                "hyprctl keyword monitor \"{},{}@{:.2},auto,{:.2},mirror,{}\"",
+            let monitor_value = format!(
+                "{},{}@{:.2},auto,{:.2},mirror,{}",
                 source_monitor_name,
                 source_resolution,
                 source_refresh_rate,
                 source_scale_float,
                 other_monitor_name
             );
-            commands::execute_hyprctl(&command);
+            let _ = self.run_hyprctl_command(
+                &["keyword", "monitor", &monitor_value],
+                "Mirrored monitor",
+            );
+        } else {
+            self.info_message = Some("No other active monitor to mirror".to_string());
         }
     }
 
@@ -358,18 +441,20 @@ impl App {
         let is_on = self.configs[idx].dpms_on;
         let monitor_name = &self.monitors[idx].name;
 
-        let command = if is_on {
-            format!("hyprctl dispatch dpms off {}", monitor_name)
-        } else {
-            format!("hyprctl dispatch dpms on {}", monitor_name)
-        };
-
-        if commands::execute_hyprctl(&command) {
+        let action = if is_on { "off" } else { "on" };
+        if commands::execute_hyprctl_args(&["dispatch", "dpms", action, monitor_name]) {
             self.configs[idx].dpms_on = !is_on;
+            self.info_message = Some(format!(
+                "DPMS {} for {}",
+                if is_on { "disabled" } else { "enabled" },
+                monitor_name
+            ));
+        } else {
+            self.info_message = Some("Failed to toggle DPMS".to_string());
         }
     }
 
-    fn apply_changes(&self) {
+    fn apply_changes(&mut self) {
         let Some(idx) = self.monitor_list_state.selected() else {
             return;
         };
@@ -377,15 +462,18 @@ impl App {
         let monitor = &self.monitors[idx];
         let config = &self.configs[idx];
 
-        let command = format!(
-            "hyprctl keyword monitor \"{},{}@{:.2},auto,{:.2}\"",
+        let monitor_value = format!(
+            "{},{}@{:.2},auto,{:.2}",
             monitor.name,
             config.resolution,
             config.refresh_rate,
             config.scale_as_float()
         );
 
-        commands::execute_hyprctl(&command);
+        let _ = self.run_hyprctl_command(
+            &["keyword", "monitor", &monitor_value],
+            "Applied monitor changes",
+        );
     }
 
     fn save_config_to_file(&mut self) {
@@ -429,17 +517,17 @@ impl App {
         }
     }
 
-    fn disable_monitor(&self) {
+    fn disable_monitor(&mut self) {
         let Some(idx) = self.monitor_list_state.selected() else {
             return;
         };
 
-        let command = format!(
-            "hyprctl keyword monitor \"{},disable\"",
-            self.monitors[idx].name
+        let monitor_value = format!("{},disable", self.monitors[idx].name);
+        let monitor_name = self.monitors[idx].name.clone();
+        let _ = self.run_hyprctl_command(
+            &["keyword", "monitor", &monitor_value],
+            &format!("Disabled {}", monitor_name),
         );
-
-        commands::execute_hyprctl(&command);
     }
 
     fn toggle_pane(&mut self) {
